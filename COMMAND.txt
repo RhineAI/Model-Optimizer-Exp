@@ -1,0 +1,77 @@
+# Qwen3.5-0.8B NVFP4 量化
+# 远程服务器 (10.176.56.244) 工作目录: /data/disk1/guohaoran/Model-Optimizer-Exp
+# 本地 `rc <cmd>` 同步+执行,或直接 SSH 进远程运行
+
+# ============================================================================
+# 1) 一次性环境搭建
+# ============================================================================
+
+uv venv --python 3.10 /data/disk1/guohaoran/Model-Optimizer-Exp/.venv
+source /data/disk1/guohaoran/Model-Optimizer-Exp/.venv/bin/activate
+cd /data/disk1/guohaoran/Model-Optimizer-Exp && uv pip install -e ".[hf]"
+uv pip install compressed-tensors fire transformers_stream_generator zstandard torchvision
+
+# ============================================================================
+# 2) 准备离线校准数据(远程无外网,默认 cnn_dailymail 拉不到)
+# ============================================================================
+
+python - <<'PY'
+import json, random
+random.seed(0)
+prompts = [
+    "Explain {t} in simple terms with two concrete examples a student can understand.",
+    "Write a short technical summary about {t}, covering history and current state of the art.",
+    "Describe how {t} works step by step, from basic definition to industry applications.",
+    "Compare {t} with related approaches; discuss strengths, weaknesses, and use cases.",
+    "Give a balanced overview of {t}, covering theory and real-world deployment at scale.",
+]
+topics = ["large language models","transformer attention","post-training quantization",
+    "mixture of experts","retrieval augmented generation","RLHF","gradient descent",
+    "batch normalization","speculative decoding","knowledge distillation","sparse attention",
+    "LoRA","chain of thought","tokenization","contrastive learning","diffusion models",
+    "NAS","weight pruning","mixed precision training","tensor parallelism","pipeline parallelism",
+    "ZeRO optimizer","flash attention","rotary embeddings","graph neural networks",
+    "self-supervised learning","vision transformers","image segmentation","object detection",
+    "semantic search","vector databases","Bayesian optimization"]
+with open("/data/disk1/guohaoran/calib_text_128.jsonl", "w") as f:
+    for _ in range(128):
+        t = random.choice(prompts).format(t=random.choice(topics)) + " " + \
+            random.choice(prompts).format(t=random.choice(topics))
+        f.write(json.dumps({"text": t}) + "\n")
+PY
+
+# ============================================================================
+# 3) 跑 NVFP4 PTQ (直接调用 hf_ptq.py)
+# ============================================================================
+# 说明: 项目自带 scripts/huggingface_example.sh 封装脚本,但它会
+#   - 把输出路径固定为 saved_models_<name>_<qformat> (拿不到 -NVFP4-T1 后缀)
+#   - 默认走 cnn_dailymail 数据集 (需要外网)
+#   - 不支持 --skip_generate / 离线环境变量
+# 因此这里直接调 hf_ptq.py 更直接
+
+mkdir -p /data/disk1/guohaoran/modelopt_logs
+
+cd /data/disk1/guohaoran/Model-Optimizer-Exp/examples/llm_ptq && \
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python -u hf_ptq.py \
+  --pyt_ckpt_path=/data/disk1/guohaoran/models/Qwen3.5-0.8B \
+  --export_path=/data/disk1/guohaoran/models/Qwen3.5-0.8B-NVFP4-T1 \
+  --qformat=nvfp4 \
+  --kv_cache_qformat=none \
+  --dataset=/data/disk1/guohaoran/calib_text_128.jsonl \
+  --calib_size=128 --calib_seq=512 --batch_size=4 \
+  --skip_generate \
+  2>&1 | tee /data/disk1/guohaoran/modelopt_logs/ptq_T1.log
+
+# ============================================================================
+# 4) 补齐 VLM 辅助文件 (exporter 不写, 从源模型拷)
+# ============================================================================
+
+SRC=/data/disk1/guohaoran/models/Qwen3.5-0.8B
+DST=/data/disk1/guohaoran/models/Qwen3.5-0.8B-NVFP4-T1
+for f in preprocessor_config.json video_preprocessor_config.json vocab.json merges.txt; do
+  [ -f "$SRC/$f" ] && cp -v "$SRC/$f" "$DST/$f"
+done
+
+# 预期产物: model.safetensors ~1.0GB + hf_quant_config.json (NVFP4/group16/kv=null)
+# 注意: RTX A6000 (Ampere, cap 8.6) 不能原生推理 NVFP4, 需 Blackwell (cap 10+)
