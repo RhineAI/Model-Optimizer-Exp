@@ -12,13 +12,13 @@
 - 校准直接跑 ``full_model`` 而不是 ``language_model``, 确保 vision / MTP
   子模块有激活数据,量化器能估出合理的 amax
 
-只剩下两类模块仍是 BF16:
-- 非 Linear/Conv 矩阵模块: ``nn.LayerNorm``, ``nn.RMSNorm``, ``nn.Embedding``,
-  ``nn.Conv1d`` (形状 (C,1,k) 这种不是矩阵乘的卷积) 等; NVFP4 量化器只作用在
-  Linear/Conv 的 ``*weight_quantizer`` / ``*input_quantizer`` 上
-- ``*_bias``: NVFP4 从不量化 bias
+权重 dtype:
+- 通过 ``--dtype`` 指定"非量化张量的 dtype" (LayerNorm / Embedding / bias 等)
+- 源模型是 bfloat16 时, ``--dtype fp16`` 会在加载后整体 cast 到 FP16
+- 导出时传 ``dtype=torch.float16``, unquantized 层以 FP16 写回 safetensors
+- NVFP4 block-scale 仍是 FP8 E4M3 (NVFP4 本身的定义), per-tensor scale 仍是 FP32
 
-所有 ``nn.Linear`` 的 weight / input 都会走 NVFP4.
+最终产物只剩两种 dtype: FP16 (非量化张量) + FP4-packed-uint8 + FP8 块尺度.
 """
 
 from __future__ import annotations
@@ -84,6 +84,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust_remote_code", action="store_true", default=False)
     parser.add_argument("--attn_implementation", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=["fp16", "bf16", "auto"], default="auto",
+                        help="非量化张量的目标 dtype. auto=跟随源模型 config.torch_dtype; "
+                             "fp16=加载后整体 cast 到 float16 并以 FP16 写回 safetensors; "
+                             "bf16=强制 bfloat16. 设为 fp16 时最终产物只有 FP16 + NVFP4 两种格式")
     return parser.parse_args()
 
 
@@ -113,6 +117,26 @@ def main() -> None:
         attn_implementation=args.attn_implementation,
     )
     full_model.eval()
+
+    # dtype cast (必须在量化之前): 整体权重切到目标 dtype, 这样校准 / 导出
+    # 都以该 dtype 运行. config.torch_dtype 同步, 避免 exporter 的 dtype
+    # 不一致 warning.
+    target_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(args.dtype)
+    if target_dtype is not None:
+        print(f"quantize_full_nvfp4: casting model to {target_dtype}")
+        full_model.to(dtype=target_dtype)
+        full_model.config.torch_dtype = target_dtype
+        if hasattr(full_model.config, "text_config"):
+            full_model.config.text_config.torch_dtype = target_dtype
+        if hasattr(full_model.config, "vision_config"):
+            full_model.config.vision_config.torch_dtype = target_dtype
+
+    # FP16 + old CUDA driver (12.6) + cuDNN 9 组合下, 某些 conv1d 配置会报
+    # CUDNN_STATUS_NOT_INITIALIZED. 关掉 cuDNN 走 aten 原生 kernel 绕过去
+    # (本脚本不训练, 推理/校准速度差异可以忽略).
+    if target_dtype is torch.float16:
+        torch.backends.cudnn.enabled = False
+        print("quantize_full_nvfp4: disabled cuDNN (FP16 conv1d workaround)")
 
     tokenizer = get_tokenizer(
         args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
@@ -153,7 +177,9 @@ def main() -> None:
     print(f"quantize_full_nvfp4: exporting to {export_path}")
 
     # 故意不设置 _mtp_layer_prefixes: MTP 层要跟普通层一样走量化
-    export_hf_checkpoint(full_model, export_dir=export_path)
+    # 显式传 dtype: 让 unquantized 层以目标 dtype 写出 (FP16 时保证产物只剩
+    # FP16 + NVFP4 两种格式, 没有 BF16)
+    export_hf_checkpoint(full_model, export_dir=export_path, dtype=target_dtype)
 
     tokenizer.save_pretrained(export_path)
 
